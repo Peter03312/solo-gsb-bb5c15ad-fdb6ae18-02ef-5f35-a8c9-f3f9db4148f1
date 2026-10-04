@@ -40,7 +40,7 @@ def clean_db():
             "papers", "reviewers", "published",
             "assignment_decisions", "reviewer_recusals", "assignment_locks",
             "submitted_reviews", "feedback_snapshots", "review_corrections",
-            "reviewer_status_changes", "institution_merges", "paper_guarantee_levels",
+            "reviewer_status_changes", "institution_merges", "paper_guarantee_levels", "review_deadlines",
         ):
             conn.execute(f"DELETE FROM {table}")
         conn.execute("UPDATE meta SET value = '0' WHERE key = 'revision'")

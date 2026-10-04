@@ -49,6 +49,18 @@
   高、中等级完整分配数最大, 最后沿用既有字典序择优; 完整可行时等级不影响
   既有容量比例与字典序优化。相同等级重试幂等 (不推进修订号), 有效变更推进
   资料修订号 +1; 论文删除或撤回时其等级行随论文级联清除 (不再参与求解)。
+- review_deadlines 表保存会务方为某个发布版设置的"一次统一 UTC 评审截止时刻"
+  (按发布序号 serial 隔离, 每版至多一行): 设置须同时携带资料修订号与发布序号,
+  时刻须晚于设置时刻且显式携带时区 (归一化为 UTC 存储); 同版同时刻重试幂等
+  (不产生新变更), 同版异时刻拒绝, 版本不符/非法时刻拒绝且不留任何改动。
+  设置截止不推进资料修订号与发布序号, 不改变当前方案及历史记录; 未设置截止时
+  沿用既有行为。服务端时刻到达截止后, 该发布版中仍未交正式评语的槽位即逾期
+  (已回避槽位不计逾期): 评审人不得再确认或交评语, 已交评语及收据保持有效
+  (相同内容重试仍幂等返回原收据)。补位预演/发布在同一写事务内判定逾期:
+  逾期槽位即使此前已确认也释放 (fixed_review_overdue), 且本次补位不得把该稿
+  重新分给该逾期评审人 (求解时该 (评审人, 论文) 对以 review_overdue 排除);
+  其余已确认槽位仍按既有规则固定。截止按发布序号隔离: 普通发布/补位发布推进
+  序号后旧版截止不约束新发布版 (旧行保留仅供追溯)。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -266,6 +278,21 @@ CREATE TABLE IF NOT EXISTS paper_guarantee_levels (
     revision   INTEGER NOT NULL,   -- 本次设置推进后的资料修订号
     updated_at TEXT NOT NULL
 );
+-- 某发布版的统一 UTC 评审截止时刻 (会务方设置, 每版至多一行, 按发布序号隔离)。
+-- deadline_at 为归一化后的 UTC ISO 8601 字符串; 设置时核对资料修订号与发布序号,
+-- 要求时刻晚于设置时的服务端 UTC 时刻; 同版同时刻重试幂等 (不产生新变更),
+-- 同版异时刻拒绝, 版本不符/非法时刻拒绝且不留改动; 设置不推进修订号/发布序号。
+-- 截止判定在各写事务内惰性完成 (截止与评语提交/确认/补位发布同事务判定,
+-- 避免并发竞态): 服务端时刻到达 deadline_at 后, 该序号下仍未交正式评语且
+-- 未回避的槽位即逾期——评审人不得再确认或交评语; 补位时逾期槽位 (含已确认)
+-- 释放且该 (评审人, 论文) 不参与该稿重算 (review_overdue), 其余已确认槽位固定。
+-- 普通发布/补位发布推进 serial 后旧版截止行保留但不约束新版 (仅供会务方追溯)。
+CREATE TABLE IF NOT EXISTS review_deadlines (
+    serial      INTEGER PRIMARY KEY,   -- 截止所约束的发布版序号
+    revision    INTEGER NOT NULL,      -- 设置时核对通过的资料修订号
+    deadline_at TEXT NOT NULL,         -- 归一化 UTC ISO 8601 截止时刻 (须晚于设置时刻)
+    set_at      TEXT NOT NULL          -- 设置时刻 (归一化 UTC)
+);
 """
 
 
@@ -404,6 +431,15 @@ def load_guarantee_levels(conn: sqlite3.Connection):
             "SELECT paper_id, level FROM paper_guarantee_levels ORDER BY paper_id"
         ).fetchall()
     }
+
+
+def load_review_deadline(conn: sqlite3.Connection, serial: int):
+    """读取某发布序号的统一评审截止行; 该版未设置截止时返回 None。"""
+    return conn.execute(
+        "SELECT serial, revision, deadline_at, set_at"
+        " FROM review_deadlines WHERE serial = ?",
+        (serial,),
+    ).fetchone()
 
 
 def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: str) -> int:
