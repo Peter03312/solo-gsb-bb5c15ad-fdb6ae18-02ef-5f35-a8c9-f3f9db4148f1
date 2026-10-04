@@ -259,11 +259,33 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
   （`409`）、不可再更新/删除（`409`）、不可再发起更正或发布快照（`409`），
   也不可再对其提交锁定表（整表 `404`）；**其他论文的确认与评语沿用既有规则**。
 
+**统一 UTC 评审截止时刻（会务方）**：会务方可对**当前发布版**经
+`POST /assignment/review-deadline` 设置一次统一截止时刻
+（`{"base_revision":N,"base_serial":S,"deadline_at":"2026-10-10T12:00:00Z"}`）：
+
+- 时刻必须是**带时区的 UTC ISO 8601** 且**严格晚于设置时刻**（naive/无法解析/不晚于现在 `422`）；
+  请求须携带资料修订号与发布序号**双版本核对**，任一不符 `409`、尚未发布 `404`，被拒请求不改变
+  当前方案及历史记录；**不推进**资料修订号或发布序号；
+- **每个发布序号至多设置一次**：同版同时刻重试幂等（`changed=false`，不产生新变更），
+  同版异时刻 `409`（原时刻不变）；
+- 逾期状态**不物化**：服务端在每个读写事务内以当前时刻实时判定，故截止判定与确认/评语提交、
+  补位发布之间**无并发竞态**；`GET /assignment/review-deadline`、`GET /assignment`、
+  `GET /papers/{id}/reviews` 及评审人取稿视图均给出各槽位
+  `unconfirmed`/`confirmed_not_submitted`/`submitted`/`overdue`/`recused` 状态；
+- **到达截止时刻仍未交正式评语的非回避槽位即逾期**（未确认与已确认未交均算）：
+  逾期评审人**不得再确认或交评语**（均 `409`，已确认的重复确认仍幂等）；
+  **已交评语及收据保持有效**（同内容重试仍返原收据）；
+- **补位预演/发布在同一写事务内释放逾期槽位（即使此前已确认）**，并在
+  `released_overdue_slots`/`fixed_reviewer_review_overdue` 中标明；**本次补位不会把该稿
+  重新分给该逾期评审人**（不影响其其他论文资格）；其余确认槽位仍按既有规则固定，已交评语沿用；
+- **旧版截止不约束新发布版**：发布序号推进后新序号未设置截止即沿用现有（无截止）行为；
+  旧截止行保留于 `deadline_history` 仅供追溯。**未设置截止时全部沿用现有行为。**
+
 **权限模型**：
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照、停用/启用评审资格并查看变更记录、发起评语更正请求并追溯更正记录、提交并查看普通分配评审人锁定表、查看作者反馈异议与冻结的原反馈并选择驳回或受理、撤回现存论文并追溯撤回记录与全部评审痕迹、按论文设置评审保障等级并查询各论文等级 |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照、停用/启用评审资格并查看变更记录、发起评语更正请求并追溯更正记录、提交并查看普通分配评审人锁定表、查看作者反馈异议与冻结的原反馈并选择驳回或受理、撤回现存论文并追溯撤回记录与全部评审痕迹、按论文设置评审保障等级并查询各论文等级、**为当前发布版设置统一 UTC 评审截止时刻并查看各槽位未确认/已确认未交/已交/逾期状态** |
 | 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 资格启用时：对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语、查看本人待更正任务并提交更正评语；资格停用后凭据仍有效但上述操作一律 `403`；论文撤回后该稿立即从取稿列表移除，对其确认/回避/评语/更正提交一律 `404`（其他论文任务不受影响） |
 | 持码者 | 快照随机访问码（路径参数，无需请求头） | 仅可读取对应论文**当前有效**的匿名反馈快照（论文编号 + 标号 1、2 的评分与评语）；凭当前有效访问码对标号 1、2 评语提交非空异议并持随机查询凭据查看处理状态（凭据在快照码失效后仍可查询）；论文撤回后该稿访问码立即失效（统一 `404`），待处理异议变为 `expired` 但凭据仍可查状态 |
 
@@ -336,7 +358,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` 及各等级已分配/未分配数量（`level_summary`）；无法完整覆盖时同样按 总数→高/中等级数→字典序 选取部分方案 |
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422` |
-| GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态；撤回稿仍在当前发布版视图中但带 `withdrawn=true` 与 `withdrawal_reason`（另返回 `withdrawn_papers` 清单），评审人侧则立即不可见 |
+| POST | `/assignment/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止时刻：`{"base_revision":N,"base_serial":S,"deadline_at":"2026-10-10T12:00:00Z"}`；每个发布序号至多一行，时刻须为带时区的 UTC ISO 8601 且严格晚于设置时刻（无时区/无法解析/不晚于现在 `422`），双版本不符 `409`，尚未发布 `404`；同版同值重试幂等（`changed=false`），同版异值 `409`（原时刻不变）；不推进任何版本号；返回截止设置与各槽位状态总览 |
+| GET | `/assignment/review-deadline` | 查看当前发布版的评审截止设置（未设置为 `null`）、`deadline_passed`、各槽位状态（`unconfirmed`/`confirmed_not_submitted`/`submitted`/`overdue`/`recused`）与 `summary` 计数、`checked_at`，及历史各序号截止行（`deadline_history`，旧版截止不约束新发布版）；尚未发布 `404` |
+| GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态与评审进度状态（`review_status`，截止后逾期槽位为 `overdue`；顶层附 `review_deadline`/`deadline_passed`）；撤回稿仍在当前发布版视图中但带 `withdrawn=true` 与 `withdrawal_reason`（另返回 `withdrawn_papers` 清单），评审人侧则立即不可见 |
 | GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`）与全部更正记录（`corrections`）；撤回稿返回 `withdrawn=true` 与撤回记录（撤回后又重新发布过普通方案时 `slots` 为空、原评语全部在 `archived_reviews`） |
 | POST | `/papers/{paper_id}/review-corrections` | 会务方发起评语更正请求：`{"paper_id","serial","reviewer_id","reason"}`；仅当前仍分配、已确认且已交评语的槽位；旧序号 `409`、已移出槽位 `404`、未确认/未交评语 `409`、空原因 `422`、**论文已撤回 `409`**；同槽位同原因重复发起幂等（`changed=false`），异原因 `409`；发起即令该稿既有反馈访问码失效 |
 | POST | `/papers/{paper_id}/feedback-snapshot` | 会务方发布面向作者的匿名反馈快照：`{"serial": N}`；资料不齐 `422` 不留新版，序号过期/超前 `409`，未发布/论文不在方案 `404`，**论文已撤回 `409`**；成功返回随机访问码与快照，同序号同两份评语收据重复请求返回原码（`changed=false`） |
@@ -347,9 +371,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | GET | `/papers/{paper_id}/objections` | 会务方按论文查看全部异议与冻结的原反馈（含按标号定位的评审人、目标收据、快照码、关联更正；可选 `?state=pending\|rejected\|accepted\|expired` 过滤） |
 | GET | `/objections` | 会务方查看全部论文异议（含已过期历史；可选 `?state=` 过滤，按提交顺序） |
 | POST | `/objections/{objection_id}/decision` | 会务方处理异议：`{"decision":"reject","note"?}`（驳回不影响快照）或 `{"decision":"accept","reason"}`（受理须非空更正原因，原子核对发布序号仍为当前序号且目标评语收据未变，按标号走既有更正请求流程并使原访问码立即失效）；异议不存在 `404`，非 pending `409`，发布版/目标评语已变化或该槽位已有待更正请求 `409` 且不改异议状态，受理空原因 `422` |
-| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；**资格停用 `403`**；已回避论文不返稿，仅列于 `recused`；**已撤回论文立即不返稿**） |
-| POST | `/reviewer/assignments/{paper_id}/decision` | 评审人提交 `{"paper_id","decision":"confirm"|"recuse","reason"?}`；幂等；未分配 `404`，已回避再确认 `409`，空回避原因 `422`，**资格停用 `403`**，**论文已撤回 `404`** |
-| POST | `/reviewer/assignments/{paper_id}/review` | 评审人提交 `{"paper_id","serial","score":1~5整数,"comment"}`；同内容重试返原收据，内容不同 `409`，序号过期/超前 `409`，未分配/已移出/已撤回 `404`，未确认/已回避 `409`，非法评分/空评语 `422`，**资格停用 `403`** |
+| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；**资格停用 `403`**；已回避论文不返稿，仅列于 `recused`；**已撤回论文立即不返稿**）；顶层附当前发布版 `review_deadline`/`deadline_passed`，每篇稿附本人槽位 `review_status`（`unconfirmed`/`confirmed_not_submitted`/`submitted`/`overdue`，另见 `review_statuses`） |
+| POST | `/reviewer/assignments/{paper_id}/decision` | 评审人提交 `{"paper_id","decision":"confirm"|"recuse","reason"?}`；幂等；未分配 `404`，已回避再确认 `409`，空回避原因 `422`，**资格停用 `403`**，**论文已撤回 `404`**，**已到评审截止且未交评语的逾期槽位不得再确认 `409`（已确认的重复确认仍幂等）** |
+| POST | `/reviewer/assignments/{paper_id}/review` | 评审人提交 `{"paper_id","serial","score":1~5整数,"comment"}`；同内容重试返原收据，内容不同 `409`，序号过期/超前 `409`，未分配/已移出/已撤回 `404`，未确认/已回避 `409`，非法评分/空评语 `422`，**资格停用 `403`**，**已到评审截止且尚无评语的逾期槽位 `409`（已交评语及收据截止后继续有效，同内容重试仍返原收据）** |
 | GET | `/reviewer/reviews` | 评审人查看本人当前有效任务上已提交的评语（不含他人评语与作者机构；**资格停用 `403`**；不含已撤回论文） |
 | GET | `/reviewer/review-corrections` | 评审人查看本人在当前发布序号下的待更正任务（含更正原因与原评语冻结内容；不含他人任务；**资格停用 `403`**；**已撤回论文的待更正任务不再列出**） |
 | POST | `/reviewer/review-corrections/{paper_id}` | 评审人提交更正评语：`{"paper_id","serial","original_receipt","score","comment"}`；首份有效更正生成新收据并更新槽位评语（原评语冻结保留）；同内容重试返更正收据（`changed=false`），异内容 `409`，序号过期/超前 `409`，无对应任务/论文已撤回 `404`，非法评分/空评语 `422`，**资格停用 `403`** |
@@ -376,7 +400,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 本轮论文撤回流程见 [`examples/withdrawals.sh`](examples/withdrawals.sh)
 （`./examples/withdrawals.sh`，建议对新库运行）；
 本轮评审保障等级流程见 [`examples/guarantee_levels.sh`](examples/guarantee_levels.sh)
-（`./examples/guarantee_levels.sh`，建议对新库运行）。
+（`./examples/guarantee_levels.sh`，建议对新库运行）；
+本轮统一 UTC 评审截止时刻流程见 [`examples/deadlines.sh`](examples/deadlines.sh)
+（`./examples/deadlines.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -854,6 +880,76 @@ curl $BASE/papers/guarantee-levels -H "$ORG"   # levels 中不再有 P2
 }
 ```
 
+### 本轮用法：当前发布版的统一 UTC 评审截止时刻
+
+会务方可为**当前发布版**设置一次统一的 UTC 评审截止时刻；未设置截止时一切沿用现有行为。
+完整可运行脚本见 [`examples/deadlines.sh`](examples/deadlines.sh)（`./examples/deadlines.sh`）。
+
+**设置（须携带资料修订号 + 发布序号双版本）：**
+
+```bash
+# 先取当前 revision/serial（/meta 或任意发布响应）
+DEADLINE=$(python3 -c 'from datetime import datetime,timedelta,timezone;print((datetime.now(timezone.utc)+timedelta(hours=2)).isoformat().replace("+00:00","Z"))')
+curl -s -X POST "$BASE/assignment/review-deadline" -H "$ORG" -H 'Content-Type: application/json' -d "{
+  \"base_revision\": $REV, \"base_serial\": $SERIAL, \"deadline_at\": \"$DEADLINE\"}"
+# -> {"ok":true,"changed":true,"serial":S,"revision":N,
+#     "review_deadline":{"serial":S,"revision":N,"deadline_at":"...Z","set_at":"...Z"},
+#     "deadline_passed":false,"checked_at":"...","summary":{
+#       "slots":2,"unconfirmed":2,"confirmed_not_submitted":0,
+#       "submitted":0,"overdue":0,"recused":0},
+#     "papers":{"P1":{"assigned":["R1","R2"],"withdrawn":false,
+#       "slots":[{"reviewer_id":"R1","state":"pending","review_status":"unconfirmed",...}, ...]}},
+#     "deadline_history":[...]}
+```
+
+设置规则：
+
+- `deadline_at` 必须是**带时区的 UTC ISO 8601**时刻（建议以 `Z` 结尾，也接受如 `2026-10-10T20:00:00+08:00` 的偏移，服务端统一折算为 UTC），且**严格晚于设置时刻**；无时区（naive）、无法解析、现在或过去的时刻一律 `422`；
+- 双版本核对优先：尚未发布 `404`；`base_revision` 或 `base_serial` 与当前不一致（过期/超前）一律 `409`，拒绝且不写入、不改变当前方案及任何历史记录；
+- 每个发布序号至多一行：**同版同值重试幂等**（`changed=false`，`set_at` 保持首次值，不产生新变更），**同版异值 `409`**（截止时刻在该序号上不可改动，原值不变）；
+- 设置截止**不推进**资料修订号，也**不推进**发布序号。
+
+**查看各槽位状态：**
+
+```bash
+curl -s "$BASE/assignment/review-deadline" -H "$ORG"
+# review_deadline=null 表示当前序号未设置截止; deadline_passed 为服务端按 checked_at 的实时判定;
+# 每个槽位 review_status ∈ {
+#   unconfirmed,                 # 未确认、未回避、未交
+#   confirmed_not_submitted,     # 已确认、未交、截止未到
+#   submitted,                   # 已交正式评语（截止后仍有效）
+#   overdue,                     # 已到截止时刻仍未交评语（未确认或已确认未交均算）
+#   recused                      # 已声明回避（不计入逾期）
+# }
+```
+
+同一状态也出现在 `GET /assignment`（槽位 `review_status`、顶层 `review_deadline`/`deadline_passed`）、
+`GET /papers/{paper_id}/reviews`（槽位 `review_status`、`progress.overdue`）与评审人
+`GET /reviewer/assignments`（每篇 `review_status` 与顶层截止信息）中，原有字段全部保留。
+
+**到达截止时刻后的行为（判定在每个读写事务内实时完成，无并发竞态）：**
+
+- 当前发布序号下仍**未交正式评语的非回避槽位即逾期**——未确认（pending）与已确认未交都算；
+- 逾期槽位的评审人**不得再确认或交评语**：`POST /reviewer/assignments/{pid}/decision`（confirm）
+  与 `POST /reviewer/assignments/{pid}/review` 均返回 `409`（已确认的重复确认仍幂等）；
+- **已交评语及收据保持有效**：相同内容的评语重试仍原样返回原收据（`changed=false`），异内容仍 `409`；
+  已发起的评语更正、已发布的快照/异议等既有语义不受影响。
+
+**补位预演与发布释放逾期槽位：**
+
+- `POST /assignment/backfill/dry-run` 在同一事务内判定逾期：逾期槽位（**即使此前已确认**）一律释放，
+  并在 `released_overdue_slots` 中列出；`papers.<论文>.excluded` 对该逾期评审人标注
+  `fixed_reviewer_review_overdue`；
+- **本次补位不会把该稿重新分给该逾期评审人**（仅禁止该稿，不影响其在其他论文上的资格）；
+  其余已确认槽位仍按既有规则固定，已交评语随连续保留槽位沿用（原收据/时间不变）；
+- `POST /assignment/backfill/publish` 仍须双版本复核（`base_revision`/`base_serial`），
+  成功后 `serial+1`，响应附 `released_overdue_slots` 计数与明细、`carried_reviews` 沿用数。
+
+**旧版截止不约束新发布版：**
+
+- 截止行按发布序号保存：普通发布或补位发布推进序号后，新序号未设置截止即**无逾期约束**（沿用现有行为），
+  需在新序号上另行设置；旧序号的截止行保留在 `deadline_history` 中仅供会务方追溯。
+
 ## 错误码
 
 | 状态码 | 场景 |
@@ -900,9 +996,9 @@ curl $BASE/papers/guarantee-levels -H "$ORG"   # levels 中不再有 P2
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用、机构归并组、已交评语更正、普通分配评审人锁定表、作者反馈异议与会务方驳回/受理、论文撤回（同事务停稿/失效快照码/过期异议/清锁定/推进修订号）、论文评审保障等级设置与查询（同事务核对修订号/幂等/推进修订号）
-  solver.py   # 分配求解器 + 固定槽位求解引擎（补位=失效释放 / 普通锁定=失效只报错不释放；容量比例、字典序、部分方案与诊断；部分方案按 总数→高/中等级数→字典序 选取并返回 level_summary；停用者直接排除；撤回稿不进入求解器输入；机构冲突一律按归并组判定）
-  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录、机构归并边与并查集分组、评语更正记录、普通分配锁定表、作者异议表与发布序号变化/论文撤回时的异议过期、papers.withdrawn 标记与 paper_withdrawals 撤回记录、paper_guarantee_levels 评审保障等级（删除/撤回随论文级联清除）
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用、机构归并组、已交评语更正、普通分配评审人锁定表、作者反馈异议与会务方驳回/受理、论文撤回（同事务停稿/失效快照码/过期异议/清锁定/推进修订号）、论文评审保障等级设置与查询（同事务核对修订号/幂等/推进修订号）、当前发布版统一 UTC 评审截止时刻（双版本核对/同值幂等/异值拒绝/逾期实时判定；逾期槽位确认与评语提交 409；补位同事务释放逾期槽位且不重分给逾期评审人；旧版截止不约束新发布版）
+  solver.py   # 分配求解器 + 固定槽位求解引擎（补位=失效释放 / 普通锁定=失效只报错不释放；容量比例、字典序、部分方案与诊断；部分方案按 总数→高/中等级数→字典序 选取并返回 level_summary；停用者直接排除；撤回稿不进入求解器输入；机构冲突一律按归并组判定；补位 forbidden_pairs 排除逾期评审人重获该稿 fixed_reviewer_review_overdue）
+  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录、机构归并边与并查集分组、评语更正记录、普通分配锁定表、作者异议表与发布序号变化/论文撤回时的异议过期、papers.withdrawn 标记与 paper_withdrawals 撤回记录、paper_guarantee_levels 评审保障等级（删除/撤回随论文级联清除）、review_deadlines 每发布序号一行的统一 UTC 评审截止时刻（旧序号行保留供追溯，不约束新序号）
   schemas.py  # 请求体模型与校验
 tests/test_api.py                # 原有接口与求解器测试（含并发发布测试）
 tests/test_backfill.py           # 确认/回避/硬回避/补位预演与发布测试
@@ -915,6 +1011,7 @@ tests/test_locks.py              # 本轮普通分配锁定表：整表替换/�
 tests/test_objections.py         # 本轮作者反馈异议：有效码提交、同理由幂等/异理由冲突、并发仅一条、随机凭据在快照码失效后可查、已失效码 404、序号变化同事务过期、会务方视图、驳回不影响快照、受理原子核对序号/收据/待更正请求并走更正流程
 tests/test_withdrawals.py        # 本轮论文撤回：修订号核对优先级/幂等原记录/异原因冲突/404/422、同编号不可重录、评审人侧即时停稿、快照码失效、异议同事务过期且凭据可查、锁定清除不阻塞他稿、普通分配/补位跳过、评语/快照/决定/更正追溯
 tests/test_guarantee_levels.py   # 本轮评审保障等级：设置/查询/幂等/版本不符/未知或已撤回/非法等级、部分方案按 总数→高/中等级数→字典序 选取、level_summary、完整可行时等级不影响优化、失效锁定不被等级释放、补位交互、删除/撤回后等级清除
+tests/test_deadlines.py          # 本轮统一 UTC 评审截止：设置双版本核对/UTC 时刻校验/同值幂等/异值拒绝/不推进版本号、四种槽位状态、逾期后确认与评语 409（已交收据仍有效）、补位释放逾期槽位且不重分（其余确认固定/评语沿用）、旧版截止不约束新序号、拒绝不改方案与历史
 examples/demo.sh          # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
 examples/backfill.sh      # 确认/回避 -> 补位预演 -> 双版本复核发布示例
 examples/reviews.sh       # 正式评语收集端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
@@ -926,6 +1023,7 @@ examples/locks.sh         # 本轮端到端示例（锁定整表提交/幂等 ->
 examples/objections.sh    # 本轮端到端示例（作者凭快照码提异议/凭据查状态/幂等冲突 -> 会务方驳回 -> 受理走更正流程并失效旧码 -> 序号变化异议过期）
 examples/withdrawals.sh   # 本轮端到端示例（确认/评语/快照/异议 -> 会务方撤回同事务生效 -> 幂等/冲突/版本不符 -> 评审人停稿、快照码失效、异议过期 -> 追溯 -> 后续分配跳过、他稿规则不变）
 examples/guarantee_levels.sh # 本轮端到端示例（设置/查询等级 -> 幂等/非法等级/版本不符 -> 容量不足时高等级优先与 level_summary -> 发布仍拒绝 -> 完整可行时等级不影响优化 -> 删除后等级清除）
+examples/deadlines.sh      # 本轮端到端示例（双版本设置统一 UTC 截止 -> 槽位状态总览 -> 同值幂等/异值/版本不符/非法时刻 -> 截止后逾期槽位 409 与已交收据有效 -> 补位释放逾期槽位且不重分 -> 旧版截止不约束新序号）
 Dockerfile / docker-compose.yml
 ```
 

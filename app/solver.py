@@ -58,7 +58,7 @@ def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
     return not reviewer.topics.isdisjoint(paper.topics)
 
 
-def analyze_paper(paper: Paper, reviewers, recused_pairs=(), inst_group=None):
+def analyze_paper(paper: Paper, reviewers, recused_pairs=(), inst_group=None, forbidden_pairs=()):
     """返回 (eligible, excluded, pairs)。
 
     eligible: 通过机构回避与回避名单过滤的评审人 (按编号升序);
@@ -67,7 +67,12 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=(), inst_group=None):
     pairs:    忽略容量时该论文的全部合法评审人对 (元组内与元组间均按编号升序)。
 
     机构比较一律按归并组 inst_group 判定; 缺省 (空映射) 时按原名逐字比较。
+    forbidden_pairs: {(reviewer_id, paper_id)} 补位专用的禁止重分关系
+                     (该评审人的该稿槽位已逾期, 本次补位不得把该稿重新分回本人;
+                     原因代码 fixed_reviewer_review_overdue, 仅补位传入)。
     """
+    forbidden_pairs = set(forbidden_pairs)
+
     def group_of(name):
         return inst_group.get(name, name) if inst_group else name
 
@@ -76,6 +81,10 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=(), inst_group=None):
     for r in reviewers:  # callers 保证 reviewers 已按 reviewer_id 升序
         if not r.active:
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "reviewer_disabled"})
+        elif (r.reviewer_id, paper.paper_id) in forbidden_pairs:
+            # 补位: 该稿曾分配给本人但评审截止后仍未交评语 (槽位逾期),
+            # 本次补位不得把该稿重新分回本人; 不改变硬回避等其他资料语义
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "fixed_reviewer_review_overdue"})
         elif group_of(r.institution) in author_groups:
             # 原名逐字相同是既有的同机构; 原名不同却同组, 说明冲突由机构归并造成
             if r.institution in paper.institutions:
@@ -103,14 +112,15 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=(), inst_group=None):
 
 
 class Solver:
-    def __init__(self, papers, reviewers, recused_pairs=(), inst_group=None):
+    def __init__(self, papers, reviewers, recused_pairs=(), inst_group=None, forbidden_pairs=()):
         self.papers = sorted(papers, key=lambda p: p.paper_id)
         self.reviewers = sorted(reviewers, key=lambda r: r.reviewer_id)
         self.inst_group = inst_group or None
+        self.forbidden_pairs = set(forbidden_pairs)
         self.info = {}
         for p in self.papers:
             eligible, excluded, pairs = analyze_paper(
-                p, self.reviewers, recused_pairs, self.inst_group
+                p, self.reviewers, recused_pairs, self.inst_group, self.forbidden_pairs
             )
             self.info[p.paper_id] = {"eligible": eligible, "excluded": excluded, "pairs": pairs}
 
@@ -388,7 +398,8 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None, lev
 #           (lock_* 诊断), 发布因此拒绝。
 
 def _compute_fixed_assignment(
-    papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, levels=None, *, strict=False
+    papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, levels=None, *,
+    strict=False, forbidden_pairs=(),
 ):
     """固定槽位求解。
 
@@ -397,6 +408,9 @@ def _compute_fixed_assignment(
                  与作者同机构 (含归并), 或被锁两人同机构/均不擅长/累计超容量,
                  该论文不可完整分配, 锁定槽位不予释放;
     strict=False 时为补位: 失效固定位置按既有规则释放并标注 fixed_* 原因。
+    forbidden_pairs: 仅补位 (strict=False) 使用的 {(reviewer_id, paper_id)}
+                 禁止重分关系——逾期槽位的 (评审人, 论文) 对, 本次补位不得把
+                 该稿重新分回该逾期评审人 (fixed_reviewer_review_overdue)。
     levels: 评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整覆盖
             目标论文时参与部分方案选取 (先总数, 再依次高/中等级数, 最后字典序);
             完整可行时不影响容量比例与字典序优化; 失效锁定 (strict) 的论文
@@ -407,8 +421,9 @@ def _compute_fixed_assignment(
     故专长要求可由另一人满足。
     """
     recused_pairs = set(recused_pairs)
+    forbidden_pairs = set(forbidden_pairs)
     levels = levels or {}
-    solver = Solver(papers, reviewers, recused_pairs, inst_group)
+    solver = Solver(papers, reviewers, recused_pairs, inst_group, forbidden_pairs)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     paper_by_id = {p.paper_id: p for p in solver.papers}
     paper_ids = [p.paper_id for p in solver.papers]
@@ -729,17 +744,23 @@ def _compute_fixed_assignment(
     }
 
 
-def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, levels=None):
+def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None,
+                     levels=None, forbidden_pairs=()):
     """补位预演: 仅面向当前发布版内的论文 (papers 已按该范围过滤)。
 
-    fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避"
-                   的关系, 这些位置固定不动; 其余位置在原有硬约束与优化次序下重算。
+    fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避
+                   且未逾期"的关系, 这些位置固定不动; 其余位置在原有硬约束与
+                   优化次序下重算。
     recused_pairs: {(reviewer_id, paper_id)} 评审人通过决定接口声明的硬回避
                    (与会务方录入的 avoid_papers 等价, 但诊断原因单独标注)。
     inst_group:    机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
     levels:        评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整
                    覆盖目标论文时参与部分方案选取 (先总数, 再依次高/中等级数,
                    最后字典序), 完整可行时不影响既有优化次序。
+    forbidden_pairs: {(reviewer_id, paper_id)} 评审截止后仍未交评语的逾期槽位;
+                   这些槽位 (即使此前已确认) 一律释放, 且本次补位不得把该稿
+                   重新分给该逾期评审人 (eligible/excluded 中标注
+                   fixed_reviewer_review_overdue, 该稿其余槽位与其他论文不受影响)。
 
     数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避等),
     该固定位置释放为可补位置, 并在 papers[pid].fixed_problems 中说明。
@@ -749,7 +770,8 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
     注意: 补位不读取普通分配锁定表——锁定仅约束普通分配, 不改变补位规则。
     """
     return _compute_fixed_assignment(
-        papers, reviewers, fixed_map, recused_pairs, inst_group, levels, strict=False
+        papers, reviewers, fixed_map, recused_pairs, inst_group, levels,
+        strict=False, forbidden_pairs=forbidden_pairs,
     )
 
 

@@ -83,6 +83,23 @@ class BackfillPublishIn(BaseModel):
     base_serial: int = Field(ge=0, description="补位预演所基于的发布序号; 期间发生过任何发布则过期")
 
 
+class ReviewDeadlineIn(BaseModel):
+    """会务方为当前发布版设置一次统一的 UTC 评审截止时刻。
+
+    每个发布序号至多设置一次: 同版 (base_revision/base_serial 与当前一致)
+    同 deadline_at 重试幂等; 同版异时刻拒绝; 版本不符一律拒绝。
+    deadline_at 为带时区的 UTC ISO 8601 时刻 (如 2026-10-10T12:00:00Z),
+    必须严格晚于服务端设置时刻; 无时区或无法解析的时刻按非法请求拒绝。
+    """
+
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+    base_serial: int = Field(ge=1, description="截止时刻所针对的发布序号; 与当前发布序号不一致即过期")
+    deadline_at: str = Field(
+        min_length=1, max_length=64,
+        description="统一 UTC 评审截止时刻 (带时区的 ISO 8601, 建议以 Z 结尾); 必须晚于设置时刻",
+    )
+
+
 class ReviewSubmissionIn(BaseModel):
     paper_id: str = Field(min_length=1, max_length=128, description="当前发布版中分配给本人且已确认的论文编号")
     serial: int = Field(ge=1, description="提交所针对的发布序号; 与当前发布序号不一致即过期")

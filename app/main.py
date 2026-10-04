@@ -32,6 +32,7 @@ from .schemas import (
     PublishIn,
     ReviewCorrectionRequestIn,
     ReviewCorrectionSubmitIn,
+    ReviewDeadlineIn,
     ReviewSubmissionIn,
     ReviewerIn,
     ReviewerStatusIn,
@@ -226,6 +227,98 @@ def _load_reviews(conn, serial):
     }
 
 
+# ---------------------------------------------------------------- 评审截止时刻
+
+def _parse_utc_deadline(raw: str):
+    """解析请求中的截止时刻字符串, 返回带时区的 UTC datetime。
+
+    接受带时区的 ISO 8601 时刻 (允许以 Z/z 结尾, 如 2026-10-10T12:00:00Z);
+    无时区信息 (naive) 或无法解析的字符串一律按非法请求处理 (422),
+    由调用方抛出。统一转换为 UTC 存储与比较, 杜绝时区歧义。
+    """
+    text = raw.strip()
+    try:
+        if text.endswith(("Z", "z")):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"非法截止时刻: {raw!r}; 必须是带时区的 ISO 8601 时刻,"
+                " 例如 2026-10-10T12:00:00Z"
+            ),
+        )
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"非法截止时刻: {raw!r}; 缺少时区信息, 统一评审截止时刻必须是 UTC 时刻"
+                " (请以 Z 结尾或显式给出 +00:00 偏移)"
+            ),
+        )
+    return dt.astimezone(timezone.utc)
+
+
+def _deadline_is_past(deadline_row, now: datetime) -> bool:
+    """服务端当前时刻 now 是否已到/过某发布序号的评审截止时刻。
+
+    逾期判定一律在调用方所处的读写事务内实时完成 (截止行不物化逾期状态):
+    配合 BEGIN IMMEDIATE 写事务串行化, 截止判定与确认/评语提交、补位发布
+    之间不存在"截止与提交竞态"。
+    """
+    if deadline_row is None:
+        return False
+    return datetime.fromisoformat(deadline_row["deadline_at"]) <= now
+
+
+def _slot_view(rid, decision_row, review_row, *, overdue=False, include_review=False):
+    """构造槽位视图 (会务方): 决定状态 + 评审进度状态, 可选附已交评语内容。"""
+    if review_row is not None:
+        status = "submitted"
+    elif decision_row is not None and decision_row["state"] == "recused":
+        status = "recused"
+    elif overdue:
+        status = "overdue"
+    elif decision_row is not None and decision_row["state"] == "confirmed":
+        status = "confirmed_not_submitted"
+    else:
+        status = "unconfirmed"
+    view = {
+        "reviewer_id": rid,
+        "state": decision_row["state"] if decision_row else "pending",
+        "review_status": status,
+        "reason": decision_row["reason"] if decision_row else None,
+        "decided_at": decision_row["decided_at"] if decision_row else None,
+        "submitted": review_row is not None,
+    }
+    if include_review:
+        view["review"] = (
+            None
+            if review_row is None
+            else {
+                "score": review_row["score"],
+                "comment": review_row["comment"],
+                "receipt": review_row["receipt"],
+                "submitted_at": review_row["submitted_at"],
+            }
+        )
+    return view
+
+
+def _deadline_view(deadline_row):
+    """截止设置行的对外视图 (None 表示该发布序号未设置截止)。"""
+    if deadline_row is None:
+        return None
+    return {
+        "serial": deadline_row["serial"],
+        "revision": deadline_row["revision"],
+        "deadline_at": deadline_row["deadline_at"],
+        "set_at": deadline_row["set_at"],
+    }
+
+
 def _correction_view(c):
     """更正记录的会务方追溯视图: 冻结的原评语 + 更正后内容 (pending 时为 None)。"""
     return {
@@ -255,25 +348,59 @@ def _correction_view(c):
     }
 
 
-def _confirmed_map(plan, decisions):
-    """已确认且未回避的关系: {paper_id: [reviewer_id, ...]}, 作为补位固定位置。"""
-    fixed = {}
-    for pid, pair in plan.items():
-        kept = [
-            rid for rid in pair
-            if (d := decisions.get((pid, rid))) is not None and d["state"] == "confirmed"
-        ]
-        if kept:
-            fixed[pid] = kept
-    return fixed
+def _build_backfill(conn, published_row, *, now=None):
+    """基于当前发布版与当前资料执行补位求解, 返回求解结果字典。
 
-
-def _build_backfill(conn, published_row):
-    """基于当前发布版与当前资料执行补位求解, 返回求解结果字典。"""
+    评审截止与补位在同一事务内判定 (调用方持有读/写事务):
+      - 当前发布序号已到截止时刻时, 仍未交正式评语的非回避槽位即逾期;
+        逾期槽位即使此前已确认也不作为固定位置 (一律释放为可补位置);
+      - 逾期 (评审人, 论文) 对作为 forbidden_pairs 传入求解器: 本次补位不会
+        把该稿重新分给该逾期评审人 (诊断原因 fixed_reviewer_review_overdue);
+        该评审人在其他论文上的资格、该稿的其余槽位均不受影响;
+      - 其余已确认未回避槽位仍按既有规则固定, 已交评语的槽位恒为已交、不逾期。
+    """
+    now = now or datetime.now(timezone.utc)
     plan = json.loads(published_row["plan"])
     serial = published_row["serial"]
     decisions = _load_decisions(conn, serial)
-    fixed = _confirmed_map(plan, decisions)
+    reviews = _load_reviews(conn, serial)
+    deadline_row = db.load_review_deadline(conn, serial)
+    is_past = _deadline_is_past(deadline_row, now)
+    overdue_pairs = set()
+    released_overdue_slots = []
+    fixed = {}
+    for pid, pair in plan.items():
+        kept = []
+        for rid in pair:
+            d = decisions.get((pid, rid))
+            has_review = (pid, rid) in reviews
+            if has_review:
+                # 已交评语 (含经更正更新的内容): 槽位有效, 若已确认则照常固定;
+                # 已交评语与收据在截止后继续有效, 绝不因截止被释放
+                if d is not None and d["state"] == "confirmed":
+                    kept.append(rid)
+                continue
+            if d is not None and d["state"] == "recused":
+                # 已回避槽位本就不会固定、不会出现在新方案中 (硬回避), 不按逾期处理
+                continue
+            if is_past:
+                # 未确认 pending 与已确认未交: 槽位逾期, 即使已确认也释放,
+                # 且本次补位不得把该稿重新分给该逾期评审人
+                overdue_pairs.add((rid, pid))
+                released_overdue_slots.append(
+                    {
+                        "paper_id": pid,
+                        "reviewer_id": rid,
+                        "state": d["state"] if d is not None else "pending",
+                        "reason": "review_overdue",
+                        "deadline_at": deadline_row["deadline_at"],
+                    }
+                )
+                continue
+            if d is not None and d["state"] == "confirmed":
+                kept.append(rid)
+        if kept:
+            fixed[pid] = kept
     all_papers, all_reviewers = _load_domain(conn)
     paper_ids = {p.paper_id for p in all_papers}
     # 撤回稿即使仍在当前发布版中也不补位 (已停止评审, 其槽位不补人, 不阻塞其他论文);
@@ -286,9 +413,13 @@ def _build_backfill(conn, published_row):
         recused_pairs=_recused_pairs(conn),
         inst_group=_institution_groups(conn),
         levels=db.load_guarantee_levels(conn),
+        forbidden_pairs=overdue_pairs,
     )
     result["serial"] = serial
     result["published_revision"] = published_row["revision"]
+    result["review_deadline"] = _deadline_view(deadline_row)
+    result["deadline_passed"] = is_past
+    result["released_overdue_slots"] = released_overdue_slots
     return result
 
 
@@ -346,6 +477,9 @@ def meta(_: bool = Depends(require_organizer)):
     with db.read_txn() as conn:
         rev = db.get_revision(conn)
         published = _load_published(conn)
+        deadline_row = (
+            db.load_review_deadline(conn, published["serial"]) if published is not None else None
+        )
         recusals = [
             {
                 "reviewer_id": r["reviewer_id"],
@@ -367,6 +501,8 @@ def meta(_: bool = Depends(require_organizer)):
             if published
             else None
         ),
+        # 当前发布版的统一评审截止设置 (未发布或未设置均为 null; 旧序号截止不约束新版)
+        "review_deadline": _deadline_view(deadline_row),
         "hard_recusals": recusals,
     }
 
@@ -1159,6 +1295,173 @@ def get_assignment_locks(_: bool = Depends(require_organizer)):
     }
 
 
+# ------------------------------------------------ 评审截止时刻 (会务方)
+
+def _deadline_overview(conn, published_row, *, now=None, include_reviews=False):
+    """在当前事务内构造"评审截止与各槽位状态"总览 (供 GET/设置接口共用)。
+
+    逾期判定、决定与评语读取全部发生在同一事务快照上:
+      - 未设置截止时沿用现有行为: 不存在逾期槽位 (unconfirmed/confirmed_not_submitted);
+      - 已到截止时刻时, 当前序号下"未交正式评语且未回避"的槽位即 overdue
+        (未确认 pending 与已确认未交都算); 已交评语槽位恒为 submitted (含经
+        更正更新的内容), 已回避槽位为 recused, 均不受截止影响;
+      - 已撤回论文不纳入统计计数 (该稿已停止评审), 但槽位仍带状态列出供会务方核对。
+    """
+    now = now or datetime.now(timezone.utc)
+    serial = published_row["serial"]
+    plan = json.loads(published_row["plan"])
+    decisions = _load_decisions(conn, serial)
+    reviews = _load_reviews(conn, serial)
+    deadline_row = db.load_review_deadline(conn, serial)
+    is_past = _deadline_is_past(deadline_row, now)
+    withdrawn_paper_ids = {
+        r["paper_id"] for r in conn.execute(
+            "SELECT paper_id FROM papers WHERE withdrawn = 1"
+        ).fetchall()
+    }
+    summary = {
+        "slots": 0,
+        "unconfirmed": 0,
+        "confirmed_not_submitted": 0,
+        "submitted": 0,
+        "overdue": 0,
+        "recused": 0,
+    }
+    papers_out = {}
+    for pid, pair in plan.items():
+        is_withdrawn = pid in withdrawn_paper_ids
+        slots = []
+        for rid in pair:
+            d = decisions.get((pid, rid))
+            r = reviews.get((pid, rid))
+            slot = _slot_view(
+                rid, d, r, overdue=is_past, include_review=include_reviews
+            )
+            slots.append(slot)
+            if not is_withdrawn:
+                summary["slots"] += 1
+                summary[slot["review_status"]] += 1
+        papers_out[pid] = {
+            "assigned": pair,
+            "withdrawn": is_withdrawn,
+            "slots": slots,
+        }
+    # 历史截止: 各发布序号至多一行; 仅当前序号的行参与逾期判定, 旧行仅供追溯
+    history = [
+        _deadline_view(row)
+        for row in conn.execute(
+            "SELECT serial, revision, deadline_at, set_at FROM review_deadlines"
+            " ORDER BY serial"
+        ).fetchall()
+    ]
+    return {
+        "serial": serial,
+        "revision": published_row["revision"],
+        "published_at": published_row["published_at"],
+        "review_deadline": _deadline_view(deadline_row),
+        "deadline_passed": is_past,
+        "checked_at": now.isoformat(),
+        "summary": summary,
+        "papers": dict(sorted(papers_out.items())),
+        "deadline_history": history,
+    }
+
+
+@app.post("/assignment/review-deadline")
+def set_review_deadline(body: ReviewDeadlineIn, _: bool = Depends(require_organizer)):
+    """会务方为当前发布版设置一次统一的 UTC 评审截止时刻。
+
+    - 请求须携带双版本: 资料修订号 base_revision 与发布序号 base_serial;
+      尚未发布 -> 404; 发布序号或资料修订号与当前不一致 (过期/超前) -> 409,
+      拒绝且不写入、不改变当前方案及任何历史记录;
+    - deadline_at 必须是带时区的 UTC ISO 8601 时刻, 且严格晚于服务端设置时刻:
+      无时区/无法解析 -> 422; 时刻不晚于当前 (现在或过去) -> 422;
+    - 每个发布序号至多一行:
+        * 同版同值 (双版本一致且截止时刻相同) 重试 -> 幂等返回原设置 (changed=false),
+          不产生新变更 (set_at 保持首次设置时间);
+        * 同版异值 -> 409 冲突, 原截止时刻不变 (截止不可在同一发布序号上改动);
+    - 设置截止不推进资料修订号, 也不推进发布序号;
+    - 旧发布序号的截止行保留供会务方追溯, 但绝不约束新发布版——新发布序号
+      需另行设置, 未设置时沿用现有 (无截止) 行为。
+    返回当前发布版的截止设置与各槽位状态总览 (与 GET 同一口径)。
+    """
+    deadline_dt = _parse_utc_deadline(body.deadline_at)
+
+    with db.write_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 无可设置截止的发布版")
+        rev = db.get_revision(conn)
+        serial = published["serial"]
+        # 双版本核对优先于一切: 版本不符一律拒绝且无任何改动
+        if body.base_serial != serial or body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"版本不符: 截止设置基于 修订号 {body.base_revision}/发布序号 {body.base_serial},"
+                    f" 当前为 修订号 {rev}/发布序号 {serial}, 请按当前发布版重新设置"
+                ),
+            )
+        # 设置时刻在写事务取得锁之后读取, 与"必须晚于设置时刻"的判定同事务, 无竞态
+        now = datetime.now(timezone.utc)
+        if deadline_dt <= now:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"非法截止时刻: {deadline_dt.isoformat()} 不晚于设置时刻 {now.isoformat()};"
+                    " 统一评审截止时刻必须晚于设置时刻"
+                ),
+            )
+        existing = db.load_review_deadline(conn, serial)
+        deadline_at = deadline_dt.isoformat()
+        if existing is not None:
+            if existing["deadline_at"] == deadline_at:
+                # 同版同值重试: 幂等返回原设置, 不产生新变更
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "revision": rev,
+                    **_deadline_overview(conn, published, now=now),
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "当前发布版已设置评审截止时刻: 同一发布序号的截止时刻不可改动,"
+                        " 同版异值的设置按冲突拒绝"
+                    ),
+                    "serial": serial,
+                    "existing_deadline_at": existing["deadline_at"],
+                    "requested_deadline_at": deadline_at,
+                },
+            )
+        conn.execute(
+            "INSERT INTO review_deadlines(serial, revision, deadline_at, set_at)"
+            " VALUES (?,?,?,?)",
+            (serial, rev, deadline_at, now.isoformat()),
+        )
+        overview = _deadline_overview(conn, published, now=now)
+    return {"ok": True, "changed": True, "revision": rev, **overview}
+
+
+@app.get("/assignment/review-deadline")
+def get_review_deadline(_: bool = Depends(require_organizer)):
+    """会务方查看当前发布版的评审截止设置与各槽位状态。
+
+    返回当前发布序号/修订号、截止设置 (未设置为 null, deadline_passed=false)、
+    各槽位状态 (unconfirmed/confirmed_not_submitted/submitted/overdue/recused)
+    及统计 summary、服务端判定时刻 checked_at, 并附各历史发布序号的截止设置
+    (deadline_history, 旧版截止不约束新发布版, 仅供会务方追溯)。尚未发布 -> 404。
+    """
+    with db.read_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案")
+        rev = db.get_revision(conn)
+        overview = _deadline_overview(conn, published)
+    return {"ok": True, "revision": rev, **overview}
+
+
 # ---------------------------------------------------------------- 预演 / 发布 (会务方)
 
 @app.post("/assignment/dry-run")
@@ -1235,6 +1538,9 @@ def get_published(_: bool = Depends(require_organizer)):
         if row is None:
             raise HTTPException(status_code=404, detail="尚未发布任何分配方案")
         decisions = _load_decisions(conn, row["serial"])
+        reviews = _load_reviews(conn, row["serial"])
+        deadline_row = db.load_review_deadline(conn, row["serial"])
+        deadline_passed = _deadline_is_past(deadline_row, datetime.now(timezone.utc))
         plan = json.loads(row["plan"])
         papers = json.loads(row["explanations"])
         withdrawn_paper_ids = {
@@ -1252,14 +1558,10 @@ def get_published(_: bool = Depends(require_organizer)):
         slots = []
         for rid in pair:
             d = decisions.get((pid, rid))
-            slots.append(
-                {
-                    "reviewer_id": rid,
-                    "state": d["state"] if d else "pending",
-                    "reason": d["reason"] if d else None,
-                    "decided_at": d["decided_at"] if d else None,
-                }
-            )
+            r = reviews.get((pid, rid))
+            # 追加评审进度状态 (未确认/已确认未交/已交/逾期/已回避), 原 state 字段保留
+            slot = _slot_view(rid, d, r, overdue=deadline_passed)
+            slots.append(slot)
         is_withdrawn = pid in withdrawn_paper_ids
         papers.setdefault(pid, {"assigned": pair})["slots"] = slots
         papers[pid]["withdrawn"] = is_withdrawn
@@ -1268,6 +1570,8 @@ def get_published(_: bool = Depends(require_organizer)):
         "serial": row["serial"],
         "revision": row["revision"],
         "published_at": row["published_at"],
+        "review_deadline": _deadline_view(deadline_row),
+        "deadline_passed": deadline_passed,
         "plan": plan,
         "papers": papers,
         "withdrawn_papers": sorted(pid for pid in plan if pid in withdrawn_paper_ids),
@@ -1345,27 +1649,15 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
             }
         decisions = _load_decisions(conn, serial)
         reviews = _load_reviews(conn, serial)
+        deadline_row = db.load_review_deadline(conn, serial)
+        deadline_passed = _deadline_is_past(deadline_row, datetime.now(timezone.utc))
         slots = []
         for rid in pair:
             d = decisions.get((paper_id, rid))
             r = reviews.get((paper_id, rid))
-            slots.append(
-                {
-                    "reviewer_id": rid,
-                    "state": d["state"] if d else "pending",
-                    "submitted": r is not None,
-                    "review": (
-                        None
-                        if r is None
-                        else {
-                            "score": r["score"],
-                            "comment": r["comment"],
-                            "receipt": r["receipt"],
-                            "submitted_at": r["submitted_at"],
-                        }
-                    ),
-                }
-            )
+            # 追加 review_status (含截止后的 overdue), 原 state/submitted/review 字段全部保留
+            slot = _slot_view(rid, d, r, overdue=deadline_passed, include_review=True)
+            slots.append(slot)
         current_receipts = {
             r["receipt"]
             for rid in pair
@@ -1403,15 +1695,19 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
         ).fetchone()
     confirmed = sum(1 for s in slots if s["state"] == "confirmed")
     submitted = sum(1 for s in slots if s["submitted"])
+    overdue = sum(1 for s in slots if s["review_status"] == "overdue")
     return {
         "paper_id": paper_id,
         "serial": serial,
         "withdrawn": withdrawal_row is not None,
         "withdrawal": _withdrawal_view(withdrawal_row) if withdrawal_row is not None else None,
+        "review_deadline": _deadline_view(deadline_row),
+        "deadline_passed": deadline_passed,
         "progress": {
             "slots": len(slots),
             "confirmed": confirmed,
             "submitted": submitted,
+            "overdue": overdue,
             "complete": submitted == len(slots),
         },
         "slots": slots,
@@ -2266,7 +2562,10 @@ def submit_decision(
     - 未分配给本人 / 论文不存在 / 尚未发布 -> 404 (视为未分配任务, 拒绝操作);
     - 回避原因必须非空 (422);
     - 有效决定 (新确认、首次回避、确认后改回避) 推进资料修订号,
-      回避立即撤销该评审人对本匿名稿的读取, 并成为后续分配的硬回避。
+      回避立即撤销该评审人对本匿名稿的读取, 并成为后续分配的硬回避;
+    - 评审截止: 当前发布序号已到截止时刻且该槽位尚未交正式评语时,
+      未确认 (pending) 槽位即逾期, 不能再确认 (409); 已确认的重复确认仍幂等;
+      已交评语槽位的确认状态保持有效。逾期判定与写入在同一写事务内, 无竞态。
     """
     if body.paper_id != paper_id:
         raise HTTPException(
@@ -2318,6 +2617,29 @@ def submit_decision(
                 changed = False
                 rev = db.get_revision(conn)
             else:
+                # 逾期判定与确认写入在同一写事务内: 当前发布序号已到截止时刻且
+                # 该槽位尚未交正式评语时, 槽位已逾期, 评审人不得再确认
+                # (已确认的重复确认走上面的幂等分支, 不产生新变更、不受影响)。
+                deadline_row = db.load_review_deadline(conn, serial)
+                already_reviewed = conn.execute(
+                    "SELECT 1 FROM submitted_reviews"
+                    " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+                    (serial, paper_id, reviewer_id),
+                ).fetchone()
+                if already_reviewed is None and _deadline_is_past(
+                    deadline_row, datetime.now(timezone.utc)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": (
+                                "评审截止时刻已过: 该槽位已逾期, 不能再确认;"
+                                " 已交评语及收据继续有效, 未交评语不再接受"
+                            ),
+                            "serial": serial,
+                            "deadline_at": deadline_row["deadline_at"],
+                        },
+                    )
                 conn.execute(
                     "INSERT INTO assignment_decisions"
                     "(serial, paper_id, reviewer_id, state, reason, decided_at)"
@@ -2381,15 +2703,25 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
     """评审人凭自身凭据读取已分配给自己的匿名稿 (仅当前发布版, 不含作者机构)。
 
     - 已回避的论文立即从取稿列表中移除 (仅在 recused 中保留编号与本人填写的原因);
-    - 补位重新发布后, 不在新方案中的关系不再授权取稿。
+    - 补位重新发布后, 不在新方案中的关系不再授权取稿;
+    - review_deadline 为会务方为当前发布版设置的统一 UTC 评审截止时刻 (未设置为 null);
+      每篇稿带本人槽位的 review_status: unconfirmed/confirmed_not_submitted/
+      submitted/overdue (已逾期即不能再确认或交评语; 已回避稿只在 recused 中)。
     """
     with db.read_txn() as conn:
         row = _load_published(conn)
         if row is None:
-            return {"reviewer_id": reviewer_id, "serial": None, "assignments": [], "recused": []}
+            return {
+                "reviewer_id": reviewer_id, "serial": None,
+                "review_deadline": None, "deadline_passed": False,
+                "assignments": [], "recused": [],
+            }
         serial = row["serial"]
         plan = json.loads(row["plan"])
         decisions = _load_decisions(conn, serial)
+        reviews = _load_reviews(conn, serial)
+        deadline_row = db.load_review_deadline(conn, serial)
+        deadline_passed = _deadline_is_past(deadline_row, datetime.now(timezone.utc))
         withdrawn_paper_ids = {
             r["paper_id"] for r in conn.execute(
                 "SELECT paper_id FROM papers WHERE withdrawn = 1"
@@ -2400,11 +2732,14 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
             for pid, rs in plan.items()
             if reviewer_id in rs and pid not in withdrawn_paper_ids
         )
-        out, recused, states = [], [], {}
+        out, recused, states, review_statuses = [], [], {}, {}
         for pid in mine:
             d = decisions.get((pid, reviewer_id))
+            r = reviews.get((pid, reviewer_id))
             state = d["state"] if d else "pending"
             states[pid] = state
+            status = _slot_view(reviewer_id, d, r, overdue=deadline_passed)["review_status"]
+            review_statuses[pid] = status
             if state == "recused":
                 recused.append({"paper_id": pid, "reason": d["reason"], "decided_at": d["decided_at"]})
                 continue
@@ -2417,14 +2752,18 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
                         "paper_id": paper["paper_id"],
                         "topics": json.loads(paper["topics"]),
                         "manuscript": paper["manuscript"],
+                        "review_status": status,
                     }
                 )
     return {
         "reviewer_id": reviewer_id,
         "serial": serial,
+        "review_deadline": _deadline_view(deadline_row),
+        "deadline_passed": deadline_passed,
         "assignments": out,
         "recused": recused,
         "states": states,
+        "review_statuses": review_statuses,
     }
 
 
@@ -2444,6 +2783,9 @@ def submit_review(
     - 同一有效任务只收一份:
         * 评分与评语完全相同的重试 -> 幂等返回原收据 (changed=false, 200);
         * 内容不同 -> 409 冲突, 已存评语不变;
+    - 评审截止: 当前发布序号已到截止时刻且该槽位尚无正式评语时, 槽位已逾期,
+      提交一律 409 拒绝 (逾期判定与写入在同一写事务内, 不存在截止与提交竞态);
+      已交评语及收据在截止后继续有效 (相同内容重试仍原样返回原收据);
     - 被拒请求不落库, 也不推进资料修订号。
     """
     if body.paper_id != paper_id:
@@ -2525,6 +2867,23 @@ def submit_review(
                         "receipt": existing["receipt"],
                         "submitted_at": existing["submitted_at"],
                     },
+                },
+            )
+        # 截止判定与评语写入在同一写事务内: 走到这里说明尚无评语 (existing is None)。
+        # 当前发布序号已到截止时刻时槽位即逾期, 不再接受评语;
+        # 已交评语 (existing is not None) 的收据与内容在上面已按既有幂等/冲突语义处理,
+        # 截止后继续有效, 不会被拦截或改动。
+        deadline_row = db.load_review_deadline(conn, current_serial)
+        if _deadline_is_past(deadline_row, datetime.now(timezone.utc)):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "评审截止时刻已过: 该槽位已逾期, 不再接受正式评语;"
+                        " 已交评语及收据继续有效"
+                    ),
+                    "serial": current_serial,
+                    "deadline_at": deadline_row["deadline_at"],
                 },
             )
         now = datetime.now(timezone.utc).isoformat()
@@ -2743,13 +3102,20 @@ def backfill_dry_run(_: bool = Depends(require_organizer)):
     已确认且未回避的关系固定, 其余位置在原有硬约束与优化次序下重算;
     无完整补位方案时返回未补齐论文及限制原因 (feasible=false)。
     响应中的 revision 与 serial 供补位发布复核。
+
+    评审截止: 当前发布序号已到截止时刻时, 仍未交评语的非回避槽位
+    (含已确认未交) 在预演中即按逾期释放 (released_overdue_slots),
+    本次补位不会把该稿重新分给该逾期评审人
+    (papers[*].excluded 中 fixed_reviewer_review_overdue);
+    其余已确认槽位仍固定, 已交评语槽位照常沿用。
     """
     with db.read_txn() as conn:
         published = _load_published(conn)
         if published is None:
             raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 无可补位版本")
         rev = db.get_revision(conn)
-        result = _build_backfill(conn, published)
+        now = datetime.now(timezone.utc)
+        result = _build_backfill(conn, published, now=now)
     result["revision"] = rev
     return result
 
@@ -2762,6 +3128,12 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
       - 当前发布版被新发布版替换 (发布序号 +1), 仅按新发布版授权取稿;
       - 仍在新方案中的 (论文, 评审人) 槽位保留其确认状态;
       - 无完整补位方案时 422, 当前发布版保持不变。
+
+    评审截止 (与求解、序号推进在同一个写事务内判定, 避免并发竞态):
+      当前发布序号已到截止时刻时, 仍未交评语的非回避槽位 (含已确认槽位)
+      一律释放参与补位, 且本次补位不会把该稿重新分给该逾期评审人;
+      已交评语及收据继续有效 (随连续保留的槽位沿用); 其余确认槽位仍固定。
+      新发布序号不继承旧截止约束 (旧截止行保留供会务方追溯)。
     """
     with db.write_txn() as conn:
         published = _load_published(conn)
@@ -2778,7 +3150,8 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
                     " 期间存在资料变更或新的发布, 请重新预演"
                 ),
             )
-        result = _build_backfill(conn, published)
+        now_dt = datetime.now(timezone.utc)
+        result = _build_backfill(conn, published, now=now_dt)
         if not result["feasible"]:
             raise HTTPException(
                 status_code=422,
@@ -2788,10 +3161,11 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
                     "diagnostics": result["diagnostics"],
                 },
             )
+        released_overdue_slots = result["released_overdue_slots"]
         new_plan = result["plan"]
         old_decisions = _load_decisions(conn, serial)
         old_reviews = _load_reviews(conn, serial)
-        now = datetime.now(timezone.utc).isoformat()
+        now = now_dt.isoformat()
         conn.execute(
             "UPDATE published SET serial = serial + 1, revision = ?, plan = ?,"
             " explanations = ?, published_at = ? WHERE id = 1",
@@ -2844,6 +3218,9 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
         "revision": rev,
         "carried_confirmations": carried,
         "carried_reviews": carried_reviews,
+        "released_overdue_slots": len(released_overdue_slots),
+        "released_overdue": released_overdue_slots,
+        "review_deadline": result["review_deadline"],
         "plan": new_plan,
     }
 

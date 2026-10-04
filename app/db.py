@@ -49,6 +49,15 @@
   高、中等级完整分配数最大, 最后沿用既有字典序择优; 完整可行时等级不影响
   既有容量比例与字典序优化。相同等级重试幂等 (不推进修订号), 有效变更推进
   资料修订号 +1; 论文删除或撤回时其等级行随论文级联清除 (不再参与求解)。
+- review_deadlines 表保存会务方为每个发布序号设置的"一次统一 UTC 评审截止时刻"
+  (每个发布序号至多一行, 以 serial 为主键; 不推进资料修订号): 设置须携带资料
+  修订号与发布序号双版本核对, 截止时刻必须晚于设置时刻; 同版同时刻重试幂等
+  (不产生新变更), 同版异时刻拒绝。旧版截止仅按行保留供会务方追溯, 绝不约束
+  新发布序号; 到达截止时刻时, 当前序号下仍未交正式评语的非回避槽位即"逾期",
+  评审人不得再确认或交评语 (已交评语与收据继续有效); 补位预演/发布在同一写
+  事务内判定逾期并释放逾期槽位 (即使此前已确认), 且本次补位不会把该稿重新
+  分给该逾期评审人。逾期状态不物化: 一律在读写事务内以当前服务器时刻与
+  deadline_at 实时比较得出, 故截止判定与评语提交/确认、补位发布之间无竞态。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -266,6 +275,18 @@ CREATE TABLE IF NOT EXISTS paper_guarantee_levels (
     revision   INTEGER NOT NULL,   -- 本次设置推进后的资料修订号
     updated_at TEXT NOT NULL
 );
+-- 每个发布序号至多一行的统一 UTC 评审截止时刻 (会务方设置, 不推进任何版本号)。
+-- 双版本核对: revision 为设置时所见的资料修订号, serial 为设置所针对的发布序号;
+-- deadline_at 必须晚于设置时刻 set_at。同版同时刻重试幂等 (原样返回, 不改 set_at),
+-- 同版异时刻按冲突拒绝, 绝不更新既有行; 旧序号的截止行永久保留仅供会务方追溯,
+-- 不约束新发布序号。逾期判定不物化: 服务端在每个读写事务内以当前时刻与
+-- deadline_at 实时比较——截止后仍未交正式评语的非回避槽位即逾期。
+CREATE TABLE IF NOT EXISTS review_deadlines (
+    serial      INTEGER PRIMARY KEY,  -- 截止时刻所针对的发布序号 (旧版行保留供追溯)
+    revision    INTEGER NOT NULL,     -- 设置时所见的资料修订号 (双版本核对之一)
+    deadline_at TEXT NOT NULL,        -- UTC ISO 8601 截止时刻 (严格晚于 set_at)
+    set_at      TEXT NOT NULL         -- 会务方设置时刻 (UTC)
+);
 """
 
 
@@ -404,6 +425,19 @@ def load_guarantee_levels(conn: sqlite3.Connection):
             "SELECT paper_id, level FROM paper_guarantee_levels ORDER BY paper_id"
         ).fetchall()
     }
+
+
+def load_review_deadline(conn: sqlite3.Connection, serial: int):
+    """读取某发布序号的评审截止设置行; 未设置返回 None。
+
+    旧发布序号的截止行永久保留供会务方追溯, 但仅当前发布序号的行会参与
+    逾期判定——旧版截止不约束新发布版。
+    """
+    return conn.execute(
+        "SELECT serial, revision, deadline_at, set_at"
+        " FROM review_deadlines WHERE serial = ?",
+        (serial,),
+    ).fetchone()
 
 
 def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: str) -> int:
